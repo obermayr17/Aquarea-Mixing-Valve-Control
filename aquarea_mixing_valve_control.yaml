@@ -1,0 +1,348 @@
+substitutions:
+  device_name: "3-way-valve-controller"
+  friendly_name: "Controller 3-way valve"
+
+  # 4 DS18B20 sensors on one wire (pin 21)
+  one_wire_pin: "13"
+  ds18b20_addr_1: "0x780000005aa32228" # Sensor 6
+  ds18b20_addr_2: "0x5B0000003467C428" # Sensor 7
+  ds18b20_addr_3: "0xBB00000039495D28" # Sensor 8
+
+  # Physical relays associated with thermostats
+  open_relay_pin:  "32"
+  close_relay_pin: "33"
+  pump_relay_pin:  "25"
+
+  # Open/close times for 3-way valve
+  open_time_s: "105s"   # time to fully open the 3-way valve
+  close_time_s: "110s"  # time to fully close the 3-way valve
+
+
+esphome:
+  name: ${device_name}
+  on_boot:  # Delay at boot: important to force the mixing valve to reset to 0% at boot
+    priority: 900  
+    then:
+      - lambda: |-
+          auto call = id(pid_target_temp).make_call();
+          call.set_mode(esphome::climate::CLIMATE_MODE_OFF);
+          call.perform();   
+      - switch.turn_on: close_switch
+      - delay: ${close_time_s}
+      - switch.turn_off: close_switch
+
+esp32:
+  board: esp32dev
+  framework: 
+    type: arduino #esp-idf  
+    version: recommended
+
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "${device_name}_AP"
+    password: "12345678"
+
+
+logger:
+  level: DEBUG 
+
+
+api:
+
+ota:
+  - platform: esphome
+
+
+web_server:
+  port: 80
+
+
+# --------------------
+# Temperature sensors 
+# --------------------
+one_wire:
+  - platform: gpio
+    pin: ${one_wire_pin}
+
+globals:
+  - id: global_curve_offset # shift heating curve from homeassistant UI
+    type: float
+    restore_value: true
+    initial_value: '3.0'
+    
+sensor:
+  # Dallas Temperature Sensors 
+  - platform: dallas_temp
+    device_class: "temperature"
+    address: ${ds18b20_addr_1}
+    name: "Water outlet temperature"
+    id: water_outlet_temp
+    unit_of_measurement: "°C"
+    accuracy_decimals: 1
+    update_interval: 10s
+
+  - platform: dallas_temp
+    device_class: "temperature"
+    address: ${ds18b20_addr_2}
+    name: "Water return temperature"
+    id: water_return_temp
+    unit_of_measurement: "°C"
+    accuracy_decimals: 1
+    update_interval: 30s
+
+  - platform: dallas_temp
+    device_class: "temperature"
+    address: ${ds18b20_addr_3}
+    name: "Water available temperature"
+    id: water_available_temp
+    unit_of_measurement: "°C"
+    accuracy_decimals: 1
+    update_interval: 30s    
+    
+  # Get values from HA
+  - platform: homeassistant
+    id: actual_room_temp
+    name: "Actual Room Temperature"
+    entity_id: sensor.panasonic_heat_pump_main_z1_temp
+  
+  - platform: homeassistant
+    id: target_room_temp
+    name: "Target Room Temperature"
+    entity_id: number.panasonic_heat_pump_main_z1_heat_request_temp 
+  
+  - platform: homeassistant
+    id: outside_temp
+    name: "Outside Temperature"
+    entity_id: sensor.panasonic_heat_pump_main_outside_temp
+
+  - platform: homeassistant
+    id: outlet_temp
+    name: "Outlet Temperature"
+    entity_id: sensor.panasonic_heat_pump_main_z1_water_temp    
+  
+  - platform: homeassistant
+    id: heat_curve_outside_high_temp
+    name: "Heat Curve Outside High Temperature"
+    entity_id: number.panasonic_heat_pump_main_z1_heat_curve_outside_high_temp
+
+  - platform: homeassistant
+    id: heat_curve_outside_low_temp
+    name: "Heat Curve Outside Low Temperature"
+    entity_id: number.panasonic_heat_pump_main_z1_heat_curve_outside_low_temp
+  
+  - platform: homeassistant
+    id: heat_curve_target_high_temp
+    name: "Heat Curve Target High Temperature"
+    entity_id: number.panasonic_heat_pump_main_z1_heat_curve_target_high_temp
+
+  - platform: homeassistant
+    id: heat_curve_target_low_temp
+    name: "Heat Curve Target Low Temperature"
+    entity_id: number.panasonic_heat_pump_main_z1_heat_curve_target_low_temp
+
+  - platform: homeassistant
+    id: heat_curve_offset
+    name: "Heat Curve Offset"
+    entity_id: input_number.heat_curve_offset
+    on_value:
+      lambda: |- 
+        id(global_curve_offset) = id(heat_curve_offset).state;    
+    
+
+# Heizkurve
+  - platform: template
+    name: "Heat Curve Target Water Temperature"
+    id: heat_curve_target_water_temp
+    lambda: |-
+      // Linear interpolation between two points
+      float target_room = id(target_room_temp).state;
+      float actual_room = id(actual_room_temp).state;
+      float target = 29.0;
+      float out_temp = id(outside_temp).state;
+      float outside_low = id(heat_curve_outside_low_temp).state;
+      float outside_high = id(heat_curve_outside_high_temp).state;
+      float target_low = id(heat_curve_target_low_temp).state;
+      float target_high = id(heat_curve_target_high_temp).state;
+      float offset = id(global_curve_offset);
+      float avail_temp = id(water_available_temp).state;
+
+      // Determine target water temperature based on outside temperature
+      if (out_temp <= outside_low) {
+        target = target_high;
+      } else if (out_temp >= outside_high) {
+        target = target_low;
+      } else {
+        // Linear interpolation
+        target = target_high + (target_low - target_high) * 
+               (out_temp - outside_low) / (outside_high - outside_low);
+      }
+
+      // Add heat curve offset
+      target += offset;
+
+      // Add room temperature offset to target water temperature
+      float room_offset = target_room - actual_room;
+      target += room_offset;
+      
+      // Limit to available temperature
+      // target = std::min(target, avail_temp); // not used
+      
+      // set target temp in PID
+      auto call = id(pid_target_temp).make_call();
+      call.set_target_temperature(target);
+      call.perform();
+      ESP_LOGI("main", "Target temp set to : %f", target);
+      return target;
+    update_interval: 30s
+    unit_of_measurement: "°C"
+    accuracy_decimals: 1
+
+  # Valve position sensor (0-100%)
+  # This does not work. Value is always zero
+  - platform: template
+    name: "Valve Position"
+    id: valve_position
+    update_interval: 10s
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    lambda: |-
+      return (id(mixing_valve_cover).position)*100.0;
+      
+  - platform: template
+    name: "Room target temperature"
+    id: room_target
+    update_interval: 10s 
+    unit_of_measurement: "°C"
+    lambda: |-
+        float target_room = id(target_room_temp).state;
+        auto call = id(room_thermostat).make_call();
+        call.set_target_temperature(target_room);
+        call.perform();  
+        return target_room;
+# --------------------
+# Relays as switches
+switch:
+  - platform: gpio
+    name: "Pump Relay"
+    pin: ${pump_relay_pin}
+    id: pump_switch
+    restore_mode: ALWAYS_OFF   # always start with pump off for safety
+
+  - platform: gpio
+    name: "Open Switch"
+    pin: ${open_relay_pin}
+    id: open_switch
+    interlock: close_switch
+    restore_mode: ALWAYS_OFF
+
+  - platform: gpio
+    name: "Close Switch"
+    pin: ${close_relay_pin}
+    id: close_switch
+    interlock: open_switch
+    restore_mode: ALWAYS_OFF
+
+# Time Based Cover to control 3-way valve
+cover:
+  - platform: time_based
+    name: "Mixing Valve Cover"
+    id: mixing_valve_cover
+    open_action:
+      - switch.turn_off: close_switch
+      - switch.turn_off: open_switch
+      - delay: 1s
+      - switch.turn_on: open_switch
+    open_duration: ${open_time_s}
+    close_action:
+      - switch.turn_off: open_switch
+      - switch.turn_off: close_switch
+      - delay: 1s
+      - switch.turn_on: close_switch
+    close_duration: ${close_time_s}
+    stop_action:
+      - switch.turn_off: open_switch
+      - switch.turn_off: close_switch
+
+
+climate:
+  # Single-point thermostat to switch pump on/off based on room temperature
+  - platform: thermostat
+    name: "Thermostat Climate Control"
+    id: room_thermostat
+    sensor: actual_room_temp
+    startup_delay: true
+    min_heating_off_time: 2min
+    min_heating_run_time: 2min
+    min_idle_time: 2min
+    heat_deadband: 0.1 °C
+    heat_overrun: -0.1 °C
+    heat_action:
+      - switch.turn_on: pump_switch    
+      - lambda: |-
+          ESP_LOGI("main", "Thermostat Heat Action triggered");
+          auto call = id(pid_target_temp).make_call();
+          call.set_mode(esphome::climate::CLIMATE_MODE_HEAT_COOL);
+          call.perform();   
+    idle_action:
+      - switch.turn_off: pump_switch
+      - lambda: |-
+          ESP_LOGI("main", "Thermostat Idle Action triggered");
+          auto call = id(pid_target_temp).make_call();
+          call.set_mode(esphome::climate::CLIMATE_MODE_OFF);
+          call.perform();   
+      - switch.turn_off:  open_switch
+      - switch.turn_on:  close_switch
+      - delay: ${close_time_s}
+      - switch.turn_off:  close_switch
+
+    visual:
+      min_temperature: 17 °C
+      max_temperature: 25 °C      
+  
+  # PID controller for water temperature regulation via 3-way valve
+  - platform: pid
+    name: "PID water outlet controller"
+    id: pid_target_temp
+    sensor: water_outlet_temp #outlet_temp
+    default_target_temperature: 29°C
+    heat_output: open_increment
+    cool_output: close_increment
+    control_parameters:
+      kp: 0.6
+      ki: 0.002
+      kd: 0.0
+      output_averaging_samples: 3
+      derivative_averaging_samples: 3
+    deadband_parameters:
+      threshold_high: 0.5 °C 
+      threshold_low: -0.5 °C
+
+output:
+  - platform: sigma_delta_output
+    update_interval: 10s
+    id: open_increment
+    turn_on_action:
+      then:
+        - switch.turn_off: close_switch
+        - switch.turn_off: open_switch
+        - delay: 1s # important to make sure the relais have been released before engaging the opposite direction 
+        - switch.turn_on: open_switch
+    turn_off_action:
+      then:
+        - switch.turn_off: open_switch
+
+  - platform: sigma_delta_output
+    update_interval: 10s
+    id: close_increment
+    turn_on_action:
+      then:
+        - switch.turn_off: close_switch
+        - switch.turn_off: open_switch
+        - delay: 1s
+        - switch.turn_on: close_switch
+    turn_off_action:
+      then:
+        - switch.turn_off: close_switch
