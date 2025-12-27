@@ -13,7 +13,7 @@ This setup has been  working fine for two years now. SCOP around 3.8.
 But I didn't solve one issue: Panasonic keeps the buffer temperature around 5-10 K higher than the target temperature for the heating. Reason for that is to allow the mixing valve to work and to reduce cycles of the heatpump. But this also reduces efficiency of the heatpump. My wish is to have a control algorithm that uses the maximum available water temperature in the buffer. This is why I decided to build this external controller board. This repository provides the code for ESPHome.  
 
 # Hardware 
-The mixing valve needs two relais to turn the valve right and left. Additionally, one switch to turn on the pump. Thu, a minimum of 3 relais are required. 
+The mixing valve needs two relays to turn the valve right and left. Additionally, one switch to turn on the pump. Thus, a minimum of 3 relays are required. 
 
 ## ESP32
 I used this 4-relay board to implement the control [LINK](https://f1atb.fr/esp32-relay-integrated-230v-ac-power-supply-sensors/). The page explains very well how to setup the board for flashing. 
@@ -23,7 +23,14 @@ Dallas temperature sensors are optional, as the values can be read from Heishamo
 Using own sensors allows for better accuracy, as Heishamon delivers temperatures with no digits only. 
 
 # Algorithm 
-The ESPhome implementation was inspired by [this]() post.
+The ESPhome implementation was inspired by [this](https://community.simon42.com/t/3-punkt-regler-fuer-3-wegeventil/18762) post but slightly modified. 
+
+## Thermostat 
+The [thermostat]() is merely to switch on and off the pump when temperature is reached. When switched off, the PID is deactivated to stop it from sending signals to the mixing valve. The visual of the thermostat can be used in the UI of Homeassistant. 
+
+## PID
+The PID controls the water temperature by sending open or closing signals to the mixing valve. To convert the continuous output of the PID to on-off signals to the mixing valve,  the Sigma_delta_output is required. 
+
 
 ## Lessons learned 
 It is important to release the relais of the mixing valve before engaging the opposite direction. Otherwise the relais may stick due to the electric current. I implemented a 1s break before switching to opposite direction. 
