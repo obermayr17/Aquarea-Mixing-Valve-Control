@@ -26,10 +26,10 @@ Using own sensors allows for better accuracy, as Heishamon delivers temperatures
 The ESPhome implementation was inspired by [this](https://community.simon42.com/t/3-punkt-regler-fuer-3-wegeventil/18762) post but slightly modified. 
 
 ## Thermostat 
-The [thermostat]() is merely to switch on and off the pump when temperature is reached. When switched off, the PID is deactivated to stop it from sending signals to the mixing valve. The visual of the thermostat can be used in the UI of Homeassistant. 
+The [thermostat](https://esphome.io/components/climate/thermostat) merely serves to switch on and off the pump when temperature is reached. When switched off, the PID is deactivated to stop it from sending signals to the mixing valve. The visual of the thermostat can be used in the UI of Homeassistant. 
 
 ## PID
-The PID controls the water temperature by sending open or closing signals to the mixing valve. To convert the continuous output of the PID to on-off signals to the mixing valve,  the Sigma_delta_output is required. 
+A [PID](https://esphome.io/components/climate/pid/) controls the actual water temperature by sending open or closing signals to the mixing valve. To convert the continuous output of the PID to on-off signals to the mixing valve,  the Sigma_delta_output is required. 
 
 
 ## Lessons learned 
