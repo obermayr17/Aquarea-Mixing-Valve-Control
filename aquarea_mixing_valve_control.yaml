@@ -1,42 +1,46 @@
+# VERSION 8 - single-owner mixing valve control
 substitutions:
-  device_name: "3-way-valve-controller"
-  friendly_name: "Controller 3-way valve"
-
-  # 4 DS18B20 sensors on one wire (pin 21)
+  device_name: "heating-controller"
+  friendly_name: "Controller 3-way valve v8"
   one_wire_pin: "13"
-  ds18b20_addr_1: "0x780000005aa32228" # Sensor 6
-  ds18b20_addr_2: "0x5B0000003467C428" # Sensor 7
-  ds18b20_addr_3: "0xBB00000039495D28" # Sensor 8
-
-  # Physical relays associated with thermostats
-  open_relay_pin:  "32"
+  ds18b20_addr_1: "0x780000005aa32228" # Water outlet
+  ds18b20_addr_2: "0x5B0000003467C428" # Water return
+  ds18b20_addr_3: "0xBB00000039495D28" # Water available
+  ds18b20_addr_5: "0x0b00000034168328" # Actual room temperature
+  open_relay_pin: "32"
   close_relay_pin: "33"
-  pump_relay_pin:  "25"
-
-  # Open/close times for 3-way valve
-  open_time_s: "105s"   # time to fully open the 3-way valve
-  close_time_s: "110s"  # time to fully close the 3-way valve
-
+  pump_relay_pin: "25"
+  open_time_s: "105s"
+  close_time_s: "110s"
+  max_pulse_ms: "2000" # longest single valve movement the PID may command
 
 esphome:
   name: ${device_name}
-  on_boot:  # Delay at boot: important to force the mixing valve to reset to 0% at boot
-    priority: 900  
+  friendly_name: ${friendly_name}
+  on_boot:
+    priority: -100
     then:
-      - lambda: |-
-          auto call = id(pid_target_temp).make_call();
-          call.set_mode(esphome::climate::CLIMATE_MODE_OFF);
-          call.perform();   
-      - switch.turn_on: close_switch
+      - globals.set:
+          id: controller_startup_closing
+          value: "true"
+      - script.execute: apply_pid_parameters
+      - climate.control:
+          id: pid_target_temp
+          mode: "OFF"
+      - switch.turn_off: pump_switch
+      - cover.close: mixing_valve_cover
       - delay: ${close_time_s}
-      - switch.turn_off: close_switch
+      - cover.stop: mixing_valve_cover
+      - globals.set:
+          id: controller_startup_closing
+          value: "false"
+      - script.execute: sync_aquarea_state
 
 esp32:
   board: esp32dev
-  framework: 
-    type: arduino #esp-idf  
+  framework:
+    type: arduino
     version: recommended
-
 
 wifi:
   ssid: !secret wifi_ssid
@@ -45,74 +49,195 @@ wifi:
     ssid: "${device_name}_AP"
     password: "12345678"
 
-
 logger:
-  level: DEBUG 
-
+  level: INFO
+  baud_rate: 0
 
 api:
+  on_client_connected:
+    then:
+      - if:
+          condition:
+            lambda: return client_info.rfind("Home Assistant", 0) == 0;
+          then:
+            - globals.set:
+                id: ha_api_clients
+                value: !lambda "return id(ha_api_clients) + 1;"
+            - script.execute: sync_aquarea_state
+  on_client_disconnected:
+    then:
+      - if:
+          condition:
+            lambda: return client_info.rfind("Home Assistant", 0) == 0;
+          then:
+            - globals.set:
+                id: ha_api_clients
+                value: !lambda "return id(ha_api_clients) > 0 ? id(ha_api_clients) - 1 : 0;"
+            - if:
+                condition:
+                  lambda: return id(ha_api_clients) == 0;
+                then:
+                  - script.execute: fail_safe_close
 
 ota:
   - platform: esphome
 
-
 web_server:
   port: 80
 
-
-# --------------------
-# Temperature sensors 
-# --------------------
 one_wire:
   - platform: gpio
     pin: ${one_wire_pin}
 
+# Tuning values persist as template numbers; these globals are runtime state only.
 globals:
-  - id: global_curve_offset # shift heating curve from homeassistant UI
-    type: float
+  - id: controller_startup_closing
+    type: bool
+    restore_value: false
+    initial_value: "false"
+  - id: ha_api_clients
+    type: int
+    restore_value: false
+    initial_value: "0"
+  - id: autotune_running
+    type: bool
+    restore_value: false
+    initial_value: "false"
+  - id: autotune_lockout
+    type: bool
+    restore_value: false
+    initial_value: "false"
+
+number:
+  - platform: template
+    name: "Heat Curve Kp"
+    id: heat_curve_kp
+    mode: box
+    entity_category: config
     restore_value: true
-    initial_value: '3.0'
-    
+    optimistic: true
+    initial_value: 0.2
+    min_value: 0
+    max_value: 5
+    step: 0.00001
+    on_value:
+      - script.execute: apply_pid_parameters
+
+  - platform: template
+    name: "Heat Curve Ki"
+    id: heat_curve_ki
+    mode: box
+    entity_category: config
+    restore_value: true
+    optimistic: true
+    initial_value: 0
+    min_value: 0
+    max_value: 1
+    step: 0.00001
+    on_value:
+      - script.execute: apply_pid_parameters
+
+  - platform: template
+    name: "Heat Curve Kd"
+    id: heat_curve_kd
+    mode: box
+    entity_category: config
+    restore_value: true
+    optimistic: true
+    initial_value: 0.002
+    min_value: 0
+    max_value: 100
+    step: 0.00001
+    on_value:
+      - script.execute: apply_pid_parameters
+
+  - platform: template
+    name: "PID Deadband"
+    id: pid_deadband
+    mode: box
+    entity_category: config
+    restore_value: true
+    optimistic: true
+    initial_value: 0.5
+    min_value: 0
+    max_value: 3
+    step: 0.1
+    on_value:
+      - script.execute: apply_pid_parameters
+
+  - platform: template
+    name: "Heat Curve Offset"
+    id: heat_curve_offset
+    mode: box
+    entity_category: config
+    restore_value: true
+    optimistic: true
+    min_value: 0
+    max_value: 10
+    step: 0.1
+
+  - platform: template
+    name: "Cooling Water Target"
+    id: cooling_water_target
+    mode: box
+    entity_category: config
+    restore_value: true
+    optimistic: true
+    min_value: 19
+    max_value: 30
+    step: 0.5
+    initial_value: 22
+
 sensor:
-  # Dallas Temperature Sensors 
   - platform: dallas_temp
-    device_class: "temperature"
     address: ${ds18b20_addr_1}
     name: "Water outlet temperature"
     id: water_outlet_temp
-    unit_of_measurement: "°C"
     accuracy_decimals: 1
     update_interval: 10s
+    filters:
+      - timeout: 30s # publishes NaN if the probe stops responding
 
   - platform: dallas_temp
-    device_class: "temperature"
     address: ${ds18b20_addr_2}
     name: "Water return temperature"
     id: water_return_temp
-    unit_of_measurement: "°C"
     accuracy_decimals: 1
     update_interval: 30s
 
   - platform: dallas_temp
-    device_class: "temperature"
     address: ${ds18b20_addr_3}
     name: "Water available temperature"
     id: water_available_temp
-    unit_of_measurement: "°C"
     accuracy_decimals: 1
-    update_interval: 30s    
-    
-  # Get values from HA
-  - platform: homeassistant
+    update_interval: 30s
+    filters:
+      - timeout: 90s
+
+  - platform: dallas_temp
+    address: ${ds18b20_addr_5}
+    name: "Actual room temperature"
     id: actual_room_temp
-    name: "Actual Room Temperature"
+    accuracy_decimals: 1
+    update_interval: 60s
+    filters:
+      - timeout: 180s
+
+  - platform: homeassistant
+    id: aquarea_room_temp
+    name: "Aquarea Room Temperature"
     entity_id: sensor.panasonic_heat_pump_main_z1_temp
-  
+
   - platform: homeassistant
     id: target_room_temp
     name: "Target Room Temperature"
-    entity_id: number.panasonic_heat_pump_main_z1_heat_request_temp 
-  
+    entity_id: number.panasonic_heat_pump_main_z1_heat_request_temp
+
+  - platform: homeassistant
+    id: cool_request_temp
+    name: "Cool Request Temperature"
+    entity_id: number.panasonic_heat_pump_main_z1_cool_request_temp
+
   - platform: homeassistant
     id: outside_temp
     name: "Outside Temperature"
@@ -121,8 +246,8 @@ sensor:
   - platform: homeassistant
     id: outlet_temp
     name: "Outlet Temperature"
-    entity_id: sensor.panasonic_heat_pump_main_z1_water_temp    
-  
+    entity_id: sensor.panasonic_heat_pump_main_z1_water_temp
+
   - platform: homeassistant
     id: heat_curve_outside_high_temp
     name: "Heat Curve Outside High Temperature"
@@ -132,7 +257,7 @@ sensor:
     id: heat_curve_outside_low_temp
     name: "Heat Curve Outside Low Temperature"
     entity_id: number.panasonic_heat_pump_main_z1_heat_curve_outside_low_temp
-  
+
   - platform: homeassistant
     id: heat_curve_target_high_temp
     name: "Heat Curve Target High Temperature"
@@ -143,93 +268,184 @@ sensor:
     name: "Heat Curve Target Low Temperature"
     entity_id: number.panasonic_heat_pump_main_z1_heat_curve_target_low_temp
 
-  - platform: homeassistant
-    id: heat_curve_offset
-    name: "Heat Curve Offset"
-    entity_id: input_number.heat_curve_offset
+  # Single source of truth for the mode the heat pump grants the heating circuit.
+  # 0 = no space heating/cooling (off, DHW-only or unknown), 1 = heat, 2 = cool.
+  - platform: template
+    name: "Aquarea Space Mode"
+    id: aquarea_space_mode
+    entity_category: diagnostic
+    accuracy_decimals: 0
+    update_interval: 5s
+    filters:
+      - delta: 0.5 # publish only on a real mode change
+    lambda: |-
+      if (!id(aquarea_main_power).state) return 0;
+      std::string mode = id(aquarea_mode).state;
+      for (char &c : mode) c = (c >= 'A' && c <= 'Z') ? c + 32 : c;
+      if (mode.find("heat") != std::string::npos) return 1;
+      if (mode.find("cool") != std::string::npos) return 2;
+      return 0;
     on_value:
-      lambda: |- 
-        id(global_curve_offset) = id(heat_curve_offset).state;    
-    
+      then:
+        - script.execute: sync_aquarea_state
 
-# Heizkurve
   - platform: template
     name: "Heat Curve Target Water Temperature"
     id: heat_curve_target_water_temp
+    update_interval: 30s
+    accuracy_decimals: 1
     lambda: |-
-      // Linear interpolation between two points
-      float target_room = id(target_room_temp).state;
-      float actual_room = id(actual_room_temp).state;
-      float target = 29.0;
-      float out_temp = id(outside_temp).state;
-      float outside_low = id(heat_curve_outside_low_temp).state;
-      float outside_high = id(heat_curve_outside_high_temp).state;
-      float target_low = id(heat_curve_target_low_temp).state;
-      float target_high = id(heat_curve_target_high_temp).state;
-      float offset = id(global_curve_offset);
-      float avail_temp = id(water_available_temp).state;
-
-      // Determine target water temperature based on outside temperature
-      if (out_temp <= outside_low) {
-        target = target_high;
-      } else if (out_temp >= outside_high) {
-        target = target_low;
-      } else {
-        // Linear interpolation
-        target = target_high + (target_low - target_high) * 
-               (out_temp - outside_low) / (outside_high - outside_low);
+      const int space_mode = (int) lroundf(id(aquarea_space_mode).state);
+      if (space_mode == 0) return NAN;
+      if (space_mode == 2) {
+        const float cooling_target = id(cooling_water_target).state;
+        return isfinite(cooling_target) ? cooling_target : NAN;
       }
 
-      // Add heat curve offset
-      target += offset;
+      const float outside = id(outside_temp).state;
+      const float outside_low = id(heat_curve_outside_low_temp).state;
+      const float outside_high = id(heat_curve_outside_high_temp).state;
+      const float target_low = id(heat_curve_target_low_temp).state;
+      const float target_high = id(heat_curve_target_high_temp).state;
+      const float room_target = id(target_room_temp).state;
+      const float room_actual = id(actual_room_temp).state;
+      const float offset = id(heat_curve_offset).state;
 
-      // Add room temperature offset to target water temperature
-      float room_offset = target_room - actual_room;
-      target += room_offset;
-      
-      // Limit to available temperature
-      // target = std::min(target, avail_temp); // not used
-      
-      // set target temp in PID
-      auto call = id(pid_target_temp).make_call();
-      call.set_target_temperature(target);
-      call.perform();
-      ESP_LOGI("main", "Target temp set to : %f", target);
+      if (!isfinite(outside) || !isfinite(outside_low) || !isfinite(outside_high) ||
+          !isfinite(target_low) || !isfinite(target_high) || !isfinite(room_target) ||
+          !isfinite(room_actual) || outside_high <= outside_low) {
+        return NAN;
+      }
+
+      float target;
+      if (outside <= outside_low) {
+        target = target_high;
+      } else if (outside >= outside_high) {
+        target = target_low;
+      } else {
+        target = target_high + (target_low - target_high) *
+                 (outside - outside_low) / (outside_high - outside_low);
+      }
+
+      target += offset + 0.5f * (room_target - room_actual);
+      if (target > 40.0f) target = 40.0f;
+      if (target < 19.0f) target = 19.0f;
+      if (id(water_available_temp).state < target) {
+        target = id(water_available_temp).state;
+      }
       return target;
-    update_interval: 30s
-    unit_of_measurement: "°C"
-    accuracy_decimals: 1
+    on_value:
+      then:
+        - if:
+            condition:
+              lambda: return isfinite(x) && id(control_inputs_valid).state &&
+                             !id(autotune_running) && !id(autotune_lockout) &&
+                             lroundf(id(aquarea_space_mode).state) == 1;
+            then:
+              - climate.control:
+                  id: pid_target_temp
+                  mode: "HEAT"
+                  target_temperature: !lambda "return x;"
+        - if:
+            condition:
+              lambda: return isfinite(x) && id(control_inputs_valid).state &&
+                             !id(autotune_running) && !id(autotune_lockout) &&
+                             lroundf(id(aquarea_space_mode).state) == 2;
+            then:
+              - climate.control:
+                  id: pid_target_temp
+                  mode: "COOL"
+                  target_temperature: !lambda "return x;"
 
-  # Valve position sensor (0-100%)
-  # This does not work. Value is always zero
   - platform: template
     name: "Valve Position"
     id: valve_position
     update_interval: 10s
     unit_of_measurement: "%"
     accuracy_decimals: 0
-    lambda: |-
-      return (id(mixing_valve_cover).position)*100.0;
-      
+    lambda: return id(mixing_valve_cover).position * 100.0f;
+
   - platform: template
     name: "Room target temperature"
     id: room_target
-    update_interval: 10s 
+    update_interval: 10s
     unit_of_measurement: "°C"
+    accuracy_decimals: 1
+    filters:
+      - delta: 0.05
     lambda: |-
-        float target_room = id(target_room_temp).state;
-        auto call = id(room_thermostat).make_call();
-        call.set_target_temperature(target_room);
-        call.perform();  
-        return target_room;
-# --------------------
-# Relays as switches
+      // Cooling uses the Aquarea cool request value, heating the heat request value.
+      const float cool_setpoint = id(cool_request_temp).state;
+      if (lroundf(id(aquarea_space_mode).state) == 2 && isfinite(cool_setpoint))
+        return cool_setpoint;
+      return id(target_room_temp).state;
+    on_value:
+      then:
+        - if:
+            condition:
+              lambda: return isfinite(x);
+            then:
+              - climate.control:
+                  id: room_thermostat
+                  target_temperature_low: !lambda "return x - 0.25f;"
+                  target_temperature_high: !lambda "return x + 0.25f;"
+
+text_sensor:
+  - platform: homeassistant
+    id: aquarea_mode
+    entity_id: select.panasonic_heat_pump_main_operating_mode_state
+    on_value:
+      then:
+        - component.update: aquarea_space_mode
+
+binary_sensor:
+  - platform: homeassistant
+    name: "Aquarea Main Power"
+    id: aquarea_main_power
+    entity_id: switch.panasonic_heat_pump_main_heatpump_state
+    on_state:
+      then:
+        - component.update: aquarea_space_mode
+
+  - platform: template
+    name: "Controller Inputs Valid"
+    id: control_inputs_valid
+    entity_category: diagnostic
+    lambda: |-
+      // Stale probes publish NaN via their timeout filter, so isfinite() covers staleness.
+      if (id(ha_api_clients) == 0) return false;
+      const int space_mode = (int) lroundf(id(aquarea_space_mode).state);
+      if (space_mode == 0) return false;
+      if (!isfinite(id(target_room_temp).state) ||
+          !isfinite(id(actual_room_temp).state) ||
+          !isfinite(id(water_outlet_temp).state)) return false;
+      if (space_mode == 2) return isfinite(id(cooling_water_target).state);
+      return isfinite(id(outside_temp).state) &&
+             isfinite(id(heat_curve_outside_low_temp).state) &&
+             isfinite(id(heat_curve_outside_high_temp).state) &&
+             id(heat_curve_outside_high_temp).state > id(heat_curve_outside_low_temp).state &&
+             isfinite(id(heat_curve_target_low_temp).state) &&
+             isfinite(id(heat_curve_target_high_temp).state) &&
+             isfinite(id(water_available_temp).state);
+    on_state:
+      then:
+        - if:
+            condition:
+              lambda: return !id(control_inputs_valid).state;
+            then:
+              - script.execute: fail_safe_close
+        - if:
+            condition:
+              lambda: return id(control_inputs_valid).state;
+            then:
+              - script.execute: sync_aquarea_state
+
 switch:
   - platform: gpio
     name: "Pump Relay"
     pin: ${pump_relay_pin}
     id: pump_switch
-    restore_mode: ALWAYS_OFF   # always start with pump off for safety
+    restore_mode: ALWAYS_OFF
 
   - platform: gpio
     name: "Open Switch"
@@ -245,30 +461,152 @@ switch:
     interlock: open_switch
     restore_mode: ALWAYS_OFF
 
-# Time Based Cover to control 3-way valve
 cover:
   - platform: time_based
     name: "Mixing Valve Cover"
     id: mixing_valve_cover
+    internal: true
+    assumed_state: true
+    manual_control: true
     open_action:
       - switch.turn_off: close_switch
-      - switch.turn_off: open_switch
-      - delay: 1s
       - switch.turn_on: open_switch
     open_duration: ${open_time_s}
     close_action:
       - switch.turn_off: open_switch
-      - switch.turn_off: close_switch
-      - delay: 1s
       - switch.turn_on: close_switch
     close_duration: ${close_time_s}
     stop_action:
       - switch.turn_off: open_switch
       - switch.turn_off: close_switch
 
+script:
+  # Applies the persisted tuning values to the running PID controller.
+  - id: apply_pid_parameters
+    mode: restart
+    then:
+      - if:
+          condition:
+            lambda: return isfinite(id(heat_curve_kp).state) && isfinite(id(heat_curve_ki).state) &&
+                           isfinite(id(heat_curve_kd).state) && isfinite(id(pid_deadband).state);
+          then:
+            - climate.pid.set_control_parameters:
+                id: pid_target_temp
+                kp: !lambda "return id(heat_curve_kp).state;"
+                ki: !lambda "return id(heat_curve_ki).state;"
+                kd: !lambda "return id(heat_curve_kd).state;"
+            - climate.pid.set_deadband_threshold_parameters:
+                id: pid_target_temp
+                threshold_high: !lambda "return id(pid_deadband).state;"
+                threshold_low: !lambda "return -id(pid_deadband).state;"
+
+  - id: sync_aquarea_state
+    mode: restart
+    then:
+      - if:
+          condition:
+            lambda: return id(autotune_running) || id(autotune_lockout);
+          then:
+            - logger.log:
+                level: DEBUG
+                tag: control
+                format: "Aquarea sync skipped: autotune owns the PID"
+          else:
+            - if:
+                condition:
+                  lambda: return id(control_inputs_valid).state;
+                then:
+                  - component.update: heat_curve_target_water_temp
+                  - if:
+                      condition:
+                        lambda: return lroundf(id(aquarea_space_mode).state) == 1;
+                      then:
+                        - climate.control:
+                            id: room_thermostat
+                            mode: "HEAT"
+                        - climate.control:
+                            id: pid_target_temp
+                            mode: "HEAT"
+                      else:
+                        - climate.control:
+                            id: room_thermostat
+                            mode: "COOL"
+                        - climate.control:
+                            id: pid_target_temp
+                            mode: "COOL"
+                            target_temperature: !lambda "return id(cooling_water_target).state;"
+                else:
+                  - climate.control:
+                      id: room_thermostat
+                      mode: "OFF"
+                  - climate.control:
+                      id: pid_target_temp
+                      mode: "OFF"
+                  - switch.turn_off: pump_switch
+                  - script.execute: fail_safe_close
+
+  - id: fail_safe_close
+    mode: single
+    then:
+      - if:
+          condition:
+            lambda: return !id(controller_startup_closing);
+          then:
+            - globals.set:
+                id: controller_startup_closing
+                value: "true"
+            - switch.turn_off: pump_switch
+            - climate.control:
+                id: room_thermostat
+                mode: "OFF"
+            - climate.control:
+                id: pid_target_temp
+                mode: "OFF"
+            - script.stop: drive_valve
+            - cover.stop: mixing_valve_cover
+            - cover.close: mixing_valve_cover
+            - delay: ${close_time_s}
+            - cover.stop: mixing_valve_cover
+            - globals.set:
+                id: controller_startup_closing
+                value: "false"
+
+  # Converts one signed PID output into a single bounded valve movement.
+  # raise_outlet selects which direction increases the outlet temperature.
+  - id: drive_valve
+    mode: single
+    parameters:
+      raise_outlet: bool
+      level: float
+    then:
+      - if:
+          condition:
+            lambda: |-
+              if (!isfinite(level) || fabsf(level) < 0.05f) return false;
+              if (!id(control_inputs_valid).state || id(controller_startup_closing) ||
+                  id(autotune_lockout)) return false;
+              const auto action = id(room_thermostat).action;
+              return action == esphome::climate::CLIMATE_ACTION_HEATING ||
+                     action == esphome::climate::CLIMATE_ACTION_COOLING;
+          then:
+            - if:
+                condition:
+                  lambda: |-
+                    const bool heating =
+                        id(room_thermostat).action == esphome::climate::CLIMATE_ACTION_HEATING;
+                    return raise_outlet == heating;
+                then:
+                  - cover.open: mixing_valve_cover
+                else:
+                  - cover.close: mixing_valve_cover
+            - delay: !lambda |-
+                int ms = (int) (fabsf(level) * ${max_pulse_ms});
+                if (ms < 100) ms = 100;
+                if (ms > ${max_pulse_ms}) ms = ${max_pulse_ms};
+                return ms;
+            - cover.stop: mixing_valve_cover
 
 climate:
-  # Single-point thermostat to switch pump on/off based on room temperature
   - platform: thermostat
     name: "Thermostat Climate Control"
     id: room_thermostat
@@ -276,73 +614,156 @@ climate:
     startup_delay: true
     min_heating_off_time: 2min
     min_heating_run_time: 2min
+    min_cooling_off_time: 2min
+    min_cooling_run_time: 2min
     min_idle_time: 2min
-    heat_deadband: 0.1 °C
-    heat_overrun: -0.1 °C
+    set_point_minimum_differential: 0.5 °C
+    # Deadband + overrun form the switching hysteresis; both must be positive or
+    # the pump short-cycles around the setpoint.
+    heat_deadband: 0.2 °C
+    heat_overrun: 0.2 °C
+    cool_deadband: 0.2 °C
+    cool_overrun: 0.2 °C
     heat_action:
-      - switch.turn_on: pump_switch    
-      - lambda: |-
-          ESP_LOGI("main", "Thermostat Heat Action triggered");
-          auto call = id(pid_target_temp).make_call();
-          call.set_mode(esphome::climate::CLIMATE_MODE_HEAT_COOL);
-          call.perform();   
+      - if:
+          condition:
+            lambda: return id(control_inputs_valid).state &&
+                            lroundf(id(aquarea_space_mode).state) == 1 &&
+                            !id(controller_startup_closing) && !id(autotune_lockout);
+          then:
+            - switch.turn_on: pump_switch
+            - climate.control:
+                id: pid_target_temp
+                mode: "HEAT"
+          else:
+            - switch.turn_off: pump_switch
+    cool_action:
+      - if:
+          condition:
+            lambda: return id(control_inputs_valid).state &&
+                            lroundf(id(aquarea_space_mode).state) == 2 &&
+                            !id(controller_startup_closing) && !id(autotune_lockout);
+          then:
+            - switch.turn_on: pump_switch
+            - climate.control:
+                id: pid_target_temp
+                mode: "COOL"
+          else:
+            - switch.turn_off: pump_switch
     idle_action:
       - switch.turn_off: pump_switch
-      - lambda: |-
-          ESP_LOGI("main", "Thermostat Idle Action triggered");
-          auto call = id(pid_target_temp).make_call();
-          call.set_mode(esphome::climate::CLIMATE_MODE_OFF);
-          call.perform();   
-      - switch.turn_off:  open_switch
-      - switch.turn_on:  close_switch
-      - delay: ${close_time_s}
-      - switch.turn_off:  close_switch
-
+      - script.execute: fail_safe_close
+    off_mode:
+      - switch.turn_off: pump_switch
+      - script.execute: fail_safe_close
     visual:
       min_temperature: 17 °C
-      max_temperature: 25 °C      
-  
-  # PID controller for water temperature regulation via 3-way valve
+      max_temperature: 30 °C
+
   - platform: pid
-    name: "PID water outlet controller"
+    name: "PID water heating outlet controller"
     id: pid_target_temp
-    sensor: water_outlet_temp #outlet_temp
-    default_target_temperature: 29°C
-    heat_output: open_increment
-    cool_output: close_increment
+    sensor: water_outlet_temp
+    default_target_temperature: 29 °C
+    heat_output: heat_valve_output
+    cool_output: cool_valve_output
+    # Gains are loaded at boot from the persisted template numbers.
     control_parameters:
-      kp: 0.6
-      ki: 0.002
+      kp: 0.0
+      ki: 0.0
       kd: 0.0
+      min_integral: -0.3
+      max_integral: 0.3
       output_averaging_samples: 3
-      derivative_averaging_samples: 3
     deadband_parameters:
-      threshold_high: 0.5 °C 
+      threshold_high: 0.5 °C
       threshold_low: -0.5 °C
+      kp_multiplier: 0.05
+      ki_multiplier: 0.02
+      kd_multiplier: 0.0
+      deadband_output_averaging_samples: 15
 
 output:
-  - platform: sigma_delta_output
-    update_interval: 10s
-    id: open_increment
-    turn_on_action:
-      then:
-        - switch.turn_off: close_switch
-        - switch.turn_off: open_switch
-        - delay: 1s # important to make sure the relais have been released before engaging the opposite direction 
-        - switch.turn_on: open_switch
-    turn_off_action:
-      then:
-        - switch.turn_off: open_switch
+  - platform: template
+    type: float
+    id: heat_valve_output
+    write_action:
+      - script.execute:
+          id: drive_valve
+          raise_outlet: true
+          level: !lambda "return state;"
 
-  - platform: sigma_delta_output
-    update_interval: 10s
-    id: close_increment
-    turn_on_action:
-      then:
-        - switch.turn_off: close_switch
-        - switch.turn_off: open_switch
-        - delay: 1s
-        - switch.turn_on: close_switch
-    turn_off_action:
-      then:
-        - switch.turn_off: close_switch
+  - platform: template
+    type: float
+    id: cool_valve_output
+    write_action:
+      - script.execute:
+          id: drive_valve
+          raise_outlet: false
+          level: !lambda "return state;"
+
+button:
+  - platform: template
+    name: "PID Autotune Start (Supervised)"
+    entity_category: config
+    on_press:
+      - if:
+          condition:
+            lambda: return id(control_inputs_valid).state && !id(controller_startup_closing) &&
+                            !id(autotune_running) && !id(autotune_lockout) &&
+                            (id(room_thermostat).action == esphome::climate::CLIMATE_ACTION_HEATING ||
+                             id(room_thermostat).action == esphome::climate::CLIMATE_ACTION_COOLING);
+          then:
+            - globals.set:
+                id: autotune_running
+                value: "true"
+            - climate.control:
+                id: pid_target_temp
+                mode: "HEAT_COOL"
+            - climate.pid.autotune:
+                id: pid_target_temp
+                positive_output: 10%
+                negative_output: -10%
+          else:
+            - logger.log:
+                level: WARN
+                tag: pid
+                format: "Autotune not started: needs valid inputs and an active heat/cool demand"
+
+  - platform: template
+    name: "PID Autotune Cancel and Close Valve"
+    entity_category: config
+    on_press:
+      - globals.set:
+          id: autotune_lockout
+          value: "true"
+      - globals.set:
+          id: autotune_running
+          value: "false"
+      - script.stop: drive_valve
+      - switch.turn_off: pump_switch
+      - climate.control:
+          id: room_thermostat
+          mode: "OFF"
+      - climate.control:
+          id: pid_target_temp
+          mode: "OFF"
+      - script.execute: fail_safe_close
+
+  - platform: template
+    name: "Save PID Gains"
+    entity_category: config
+    on_press:
+      - number.set:
+          id: heat_curve_kp
+          value: !lambda "return id(pid_target_temp).get_kp();"
+      - number.set:
+          id: heat_curve_ki
+          value: !lambda "return id(pid_target_temp).get_ki();"
+      - number.set:
+          id: heat_curve_kd
+          value: !lambda "return id(pid_target_temp).get_kd();"
+      - globals.set:
+          id: autotune_running
+          value: "false"
+      - script.execute: sync_aquarea_state
