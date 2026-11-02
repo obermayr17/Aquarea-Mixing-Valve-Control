@@ -79,7 +79,7 @@ The ESPHome implementation was inspired by [this 3-point controller for a 3-way 
 
 ### Thermostat
 
-The [thermostat](https://esphome.io/components/climate/thermostat) mainly serves to switch the pump on and off once the temperature target is reached. When it switches off, the PID is also deactivated so it stops sending signals to the mixing valve. The thermostat view can be used in the Home Assistant UI.
+The [thermostat](https://esphome.io/components/climate/thermostat) mainly serves to switch the pump on and off once the temperature target is reached. When its action becomes idle, the PID is deactivated and the valve is homed closed, but the thermostat remains in HEAT/COOL mode so it can resume demand when the room temperature crosses the setpoint again. Safety shutdowns still turn the thermostat off. The thermostat view can be used in the Home Assistant UI.
 
 ### PID
 
