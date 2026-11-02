@@ -571,6 +571,29 @@ script:
                 id: controller_startup_closing
                 value: "false"
 
+  - id: thermostat_idle_close
+    mode: single
+    then:
+      - if:
+          condition:
+            lambda: return !id(controller_startup_closing);
+          then:
+            - globals.set:
+                id: controller_startup_closing
+                value: "true"
+            - switch.turn_off: pump_switch
+            - climate.control:
+                id: pid_target_temp
+                mode: "OFF"
+            - script.stop: drive_valve
+            - cover.stop: mixing_valve_cover
+            - cover.close: mixing_valve_cover
+            - delay: ${close_time_s}
+            - cover.stop: mixing_valve_cover
+            - globals.set:
+                id: controller_startup_closing
+                value: "false"
+
   # Converts one signed PID output into a single bounded valve movement.
   # raise_outlet selects which direction increases the outlet temperature.
   - id: drive_valve
@@ -652,7 +675,7 @@ climate:
             - switch.turn_off: pump_switch
     idle_action:
       - switch.turn_off: pump_switch
-      - script.execute: fail_safe_close
+      - script.execute: thermostat_idle_close
     off_mode:
       - switch.turn_off: pump_switch
       - script.execute: fail_safe_close
