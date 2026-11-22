@@ -357,6 +357,8 @@ sensor:
                   mode: "COOL"
                   target_temperature: !lambda "return x;"
 
+    unit_of_measurement: °C
+    device_class: temperature
   - platform: template
     name: "Valve Position"
     id: valve_position
